@@ -13,7 +13,7 @@ static FILE_REFERENCE_REGEX: Lazy<regex::Regex> = Lazy::new(|| {
 
 const MAX_DEPTH: usize = 3;
 const MAX_REFERENCE_OPERATIONS: usize = 64;
-const MAX_EXPANDED_OUTPUT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_HINT_OUTPUT_BYTES: usize = 1024 * 1024;
 
 struct FileReference {
     path: PathBuf,
@@ -48,7 +48,6 @@ impl ExpansionBudget {
 
     fn reserve_output(&mut self, bytes: usize) -> bool {
         if self.exhausted || bytes > self.remaining_output_bytes {
-            self.exhausted = true;
             return false;
         }
 
@@ -59,13 +58,8 @@ impl ExpansionBudget {
         true
     }
 
-    fn can_fit_output(&mut self, bytes: usize) -> bool {
-        if self.exhausted || bytes > self.remaining_output_bytes {
-            self.exhausted = true;
-            return false;
-        }
-
-        true
+    fn can_fit_output(&self, bytes: usize) -> bool {
+        !self.exhausted && bytes <= self.remaining_output_bytes
     }
 }
 
@@ -149,6 +143,10 @@ fn expanded_output_cost(reference: &Path, content_bytes: usize) -> Option<usize>
     content_bytes.checked_add(wrapper_bytes)
 }
 
+fn replaced_reference_cost(reference: &Path) -> Option<usize> {
+    reference.to_string_lossy().len().checked_add(1)
+}
+
 fn content_between(content: &str, start: usize, end: usize) -> &str {
     content
         .get(start..end)
@@ -195,17 +193,21 @@ fn process_file_reference(
     budget: &mut ExpansionBudget,
 ) -> Option<String> {
     let wrapper_bytes = expanded_output_cost(reference, 0)?;
-    if !budget.can_fit_output(wrapper_bytes) {
+    let replaced_bytes = replaced_reference_cost(reference)?;
+    let wrapper_growth = wrapper_bytes.saturating_sub(replaced_bytes);
+    if !budget.can_fit_output(wrapper_growth) {
         return None;
     }
 
     let file_size = usize::try_from(std::fs::metadata(safe_path).ok()?.len()).ok()?;
     let estimated_output = expanded_output_cost(reference, file_size)?;
-    if !budget.can_fit_output(estimated_output) {
+    let estimated_growth = estimated_output.saturating_sub(replaced_bytes);
+    if !budget.can_fit_output(estimated_growth) {
         return None;
     }
 
-    let max_content_bytes = budget.remaining_output_bytes - wrapper_bytes;
+    let max_replacement_bytes = budget.remaining_output_bytes.checked_add(replaced_bytes)?;
+    let max_content_bytes = max_replacement_bytes.checked_sub(wrapper_bytes)?;
     let read_limit = u64::try_from(max_content_bytes).ok()?.saturating_add(1);
     let mut content = String::new();
     let read_result = std::fs::File::open(safe_path)
@@ -219,7 +221,8 @@ fn process_file_reference(
     }
 
     let output_bytes = expanded_output_cost(reference, content.len())?;
-    if !budget.reserve_output(output_bytes) {
+    let output_growth = output_bytes.saturating_sub(replaced_bytes);
+    if !budget.reserve_output(output_growth) {
         return None;
     }
 
@@ -311,13 +314,44 @@ fn read_referenced_files_with_budget(
     ignore_patterns: &Gitignore,
     budget: &mut ExpansionBudget,
 ) -> String {
-    let content = match std::fs::read_to_string(file_path) {
-        Ok(content) => content,
+    let max_content_bytes = budget.remaining_output_bytes;
+    let file_size = match std::fs::metadata(file_path)
+        .and_then(|metadata| usize::try_from(metadata.len()).map_err(std::io::Error::other))
+    {
+        Ok(file_size) => file_size,
         Err(e) => {
-            tracing::warn!("Could not read file {:?}: {}", file_path, e);
+            tracing::warn!("Could not inspect hint file {:?}: {}", file_path, e);
             return String::new();
         }
     };
+    if file_size > max_content_bytes {
+        tracing::warn!(
+            "Hint file too large: {:?} ({} bytes, remaining limit: {} bytes)",
+            file_path,
+            file_size,
+            max_content_bytes
+        );
+        return String::new();
+    }
+
+    let read_limit = u64::try_from(max_content_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let mut content = String::new();
+    let read_result = std::fs::File::open(file_path)
+        .and_then(|file| file.take(read_limit).read_to_string(&mut content));
+    if let Err(e) = read_result {
+        tracing::warn!("Could not read hint file {:?}: {}", file_path, e);
+        return String::new();
+    }
+    if content.len() > max_content_bytes || !budget.reserve_output(content.len()) {
+        tracing::warn!(
+            "Hint file too large: {:?} (remaining limit: {} bytes)",
+            file_path,
+            max_content_bytes
+        );
+        return String::new();
+    }
 
     expand_file_content(
         &content,
@@ -330,14 +364,15 @@ fn read_referenced_files_with_budget(
     )
 }
 
-pub fn read_referenced_files(
+pub(crate) fn read_referenced_files_with_limit(
     file_path: &Path,
     import_boundary: &Path,
     visited: &mut HashSet<PathBuf>,
     depth: usize,
     ignore_patterns: &Gitignore,
+    output_limit: usize,
 ) -> String {
-    let mut budget = ExpansionBudget::new(MAX_REFERENCE_OPERATIONS, MAX_EXPANDED_OUTPUT_BYTES);
+    let mut budget = ExpansionBudget::new(MAX_REFERENCE_OPERATIONS, output_limit);
     read_referenced_files_with_budget(
         file_path,
         import_boundary,
@@ -345,6 +380,24 @@ pub fn read_referenced_files(
         depth,
         ignore_patterns,
         &mut budget,
+    )
+}
+
+#[cfg(test)]
+fn read_referenced_files(
+    file_path: &Path,
+    import_boundary: &Path,
+    visited: &mut HashSet<PathBuf>,
+    depth: usize,
+    ignore_patterns: &Gitignore,
+) -> String {
+    read_referenced_files_with_limit(
+        file_path,
+        import_boundary,
+        visited,
+        depth,
+        ignore_patterns,
+        MAX_HINT_OUTPUT_BYTES,
     )
 }
 
@@ -503,6 +556,43 @@ mod tests {
         }
 
         #[test]
+        fn test_top_level_content_is_rejected_over_output_limit() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let import_boundary = temp_dir.path();
+            let ignore_patterns = create_ignore_patterns(import_boundary);
+            let main_file = create_file(import_boundary, "main.md", &"x".repeat(33));
+
+            let expanded = read_with_budget(
+                &main_file,
+                import_boundary,
+                &ignore_patterns,
+                MAX_REFERENCE_OPERATIONS,
+                32,
+            );
+
+            assert!(expanded.is_empty());
+        }
+
+        #[test]
+        fn test_top_level_content_at_output_limit_is_preserved() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let import_boundary = temp_dir.path();
+            let ignore_patterns = create_ignore_patterns(import_boundary);
+            let content = "legitimate hint";
+            let main_file = create_file(import_boundary, "main.md", content);
+
+            let expanded = read_with_budget(
+                &main_file,
+                import_boundary,
+                &ignore_patterns,
+                MAX_REFERENCE_OPERATIONS,
+                content.len(),
+            );
+
+            assert_eq!(expanded, content);
+        }
+
+        #[test]
         fn test_reference_operation_budget_preserves_excess_references() {
             let temp_dir = tempfile::tempdir().unwrap();
             let import_boundary = temp_dir.path();
@@ -559,7 +649,34 @@ mod tests {
             );
 
             assert!(expanded.contains("@included_8.md"));
-            assert!(expanded.len() <= references.join("\n").len() + 1_048_576);
+            assert!(expanded.len() <= MAX_HINT_OUTPUT_BYTES);
+        }
+
+        #[test]
+        fn test_oversized_reference_does_not_block_later_reference() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let import_boundary = temp_dir.path();
+            let ignore_patterns = create_ignore_patterns(import_boundary);
+            create_file(import_boundary, "large.md", &"large".repeat(100));
+            let small_content = "small content";
+            create_file(import_boundary, "small.md", small_content);
+            let main_content = "@large.md\n@small.md";
+            let main_file = create_file(import_boundary, "main.md", main_content);
+            let small_growth = expanded_output_cost(Path::new("small.md"), small_content.len())
+                .unwrap()
+                - replaced_reference_cost(Path::new("small.md")).unwrap();
+
+            let expanded = read_with_budget(
+                &main_file,
+                import_boundary,
+                &ignore_patterns,
+                MAX_REFERENCE_OPERATIONS,
+                main_content.len() + small_growth,
+            );
+
+            assert!(expanded.contains("@large.md"));
+            assert!(!expanded.contains("largelarge"));
+            assert!(expanded.contains("small content"));
         }
 
         #[test]
@@ -579,7 +696,7 @@ mod tests {
                 import_boundary,
                 &ignore_patterns,
                 2,
-                MAX_EXPANDED_OUTPUT_BYTES,
+                MAX_HINT_OUTPUT_BYTES,
             );
 
             assert_eq!(expanded.matches("shared content").count(), 2);
@@ -603,7 +720,7 @@ mod tests {
                 import_boundary,
                 &ignore_patterns,
                 3,
-                MAX_EXPANDED_OUTPUT_BYTES,
+                MAX_HINT_OUTPUT_BYTES,
             );
 
             assert!(expanded.contains("leaf one"));
@@ -620,31 +737,35 @@ mod tests {
             let included_content = "included content";
             create_file(import_boundary, "included.md", included_content);
             create_file(import_boundary, "later.md", "later content");
-            let main_file = create_file(import_boundary, "main.md", "@included.md\n@later.md");
+            let main_content = "@included.md\n@later.md";
+            let main_file = create_file(import_boundary, "main.md", main_content);
             let exact_cost =
                 expanded_output_cost(Path::new("included.md"), included_content.len()).unwrap();
+            let replaced_bytes = replaced_reference_cost(Path::new("included.md")).unwrap();
+            let total_limit = main_content.len() + exact_cost - replaced_bytes;
 
             let at_boundary = read_with_budget(
                 &main_file,
                 import_boundary,
                 &ignore_patterns,
                 MAX_REFERENCE_OPERATIONS,
-                exact_cost,
+                total_limit,
             );
             let below_boundary = read_with_budget(
                 &main_file,
                 import_boundary,
                 &ignore_patterns,
                 MAX_REFERENCE_OPERATIONS,
-                exact_cost - 1,
+                total_limit - 1,
             );
 
             assert!(at_boundary.contains("included content"));
             assert!(at_boundary.contains("@later.md"));
             assert!(!at_boundary.contains("later content"));
             assert!(below_boundary.contains("@included.md"));
-            assert!(below_boundary.contains("@later.md"));
             assert!(!below_boundary.contains("included content"));
+            assert!(!below_boundary.contains("@later.md"));
+            assert!(below_boundary.contains("later content"));
         }
 
         #[test]
