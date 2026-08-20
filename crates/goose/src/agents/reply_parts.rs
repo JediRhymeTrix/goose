@@ -216,11 +216,10 @@ impl Agent {
 
         let mut prompt_manager = self.prompt_manager.lock().await;
         let system_prompt = prompt_manager
-            .builder_with_fresh_hints(working_dir)
+            .builder_with_fresh_hints(working_dir, goose_mode)
             .with_extensions(extensions_info.into_iter())
             .with_frontend_instructions(self.frontend_instructions.lock().await.clone())
             .with_code_execution_mode(code_execution_active)
-            .with_goose_mode(goose_mode)
             .build();
 
         let (tools, toolshim_tools, system_prompt) =
