@@ -540,23 +540,19 @@ impl Inference<Session, GooseEffect> for InferenceRunner<'_> {
                             if let Some(inference) = &inference {
                                 chunk = chunk.with_inference_if_assistant(inference.clone());
                             }
-                            chunk.content.retain(|content| match content {
-                                MessageContent::ToolRequest(request) => {
-                                    tool_request_ids.insert(request.id.clone())
-                                }
-                                _ => true,
-                            });
-                            if chunk
-                                .content
-                                .iter()
-                                .any(|content| matches!(content, MessageContent::ToolRequest(_)))
-                            {
+                            if chunk.role == rmcp::model::Role::Assistant {
                                 self.set_message_meta(
                                     &mut chunk,
                                     ADVERTISED_TOOLS_NOTE,
                                     advertised_tools_note.clone(),
                                 );
                             }
+                            chunk.content.retain(|content| match content {
+                                MessageContent::ToolRequest(request) => {
+                                    tool_request_ids.insert(request.id.clone())
+                                }
+                                _ => true,
+                            });
                             normalize_tool_call_thinking(&mut accumulator, &mut chunk);
                             if chunk.content.is_empty() {
                                 if chunk.metadata.output_token_limit_reached {
