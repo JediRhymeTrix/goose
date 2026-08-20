@@ -33,8 +33,12 @@ fn reconstructed_subdirectory_hints(
     conversation: &Conversation,
     working_dir: &std::path::Path,
 ) -> Vec<(String, String)> {
-    super::ops_llm::reconstructed_hint_snapshot(conversation, working_dir, GooseMode::Auto)
-        .subdirectories
+    super::ops_llm::reconstructed_hint_snapshot(
+        conversation,
+        working_dir,
+        crate::hints::HINT_EXTRA_SEPARATOR_BYTES,
+    )
+    .subdirectories
 }
 
 #[derive(Clone, Copy)]
