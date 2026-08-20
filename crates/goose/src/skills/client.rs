@@ -54,6 +54,15 @@ impl SkillsClient {
             })
             .collect()
     }
+
+    fn discover_skills_with_details(&self) -> Vec<super::DiscoveredSkill> {
+        super::discover_skills_with_details(Some(&self.working_dir))
+            .into_iter()
+            .filter(|skill| {
+                !self.exclude_builtin_skills || skill.source_type != SourceType::BuiltinSkill
+            })
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -130,7 +139,7 @@ impl McpClientTrait for SkillsClient {
             .and_then(|args| args.get("args"))
             .and_then(|v| v.as_str());
 
-        let skills = self.discover_skills();
+        let skills = self.discover_skills_with_details();
 
         if let Some(skill) = skills.iter().find(|s| s.name == skill_name) {
             return match loaded_skill_context_with_args(skill, args) {
@@ -159,7 +168,12 @@ impl McpClientTrait for SkillsClient {
                         continue;
                     }
 
-                    let result = match super::load_supporting_file(&skill_dir, rel, skill_name) {
+                    let result = match super::load_supporting_file(
+                        &skill_dir,
+                        rel,
+                        skill_name,
+                        skill.linked_skill_root,
+                    ) {
                         Ok(content) => CallToolResult::success(vec![ContentBlock::text(content)]),
                         Err(e) => CallToolResult::error(vec![ContentBlock::text(format!(
                             "Failed to read '{}': {}",
