@@ -26,6 +26,8 @@ use tracing_futures::Instrument;
 const EMPTY_RESPONSE_MESSAGE: &str =
     "The model returned an empty response. Please resend your message to continue.";
 const CANCELLED_TOOL_RESPONSE: &str = "Tool call was cancelled before execution";
+pub(super) const ADVERTISED_TOOLS_NOTE: &str = "advertised_tools";
+pub(super) const LLM_OPERATION_NAME: &str = "llm";
 
 fn is_thinking(content: &MessageContent) -> bool {
     matches!(
@@ -197,7 +199,7 @@ impl<'a> InferenceRunner<'a> {
 #[async_trait]
 impl Operation<Session, GooseEffect> for InferenceRunner<'_> {
     fn name(&self) -> &'static str {
-        "llm"
+        LLM_OPERATION_NAME
     }
 
     async fn cancel(
@@ -404,14 +406,15 @@ impl Inference<Session, GooseEffect> for InferenceRunner<'_> {
                     system_prompt,
                     &self.model_config,
                 );
-            let mut available_tools = tools
+            let mut advertised_tools = tools
                 .iter()
                 .chain(toolshim_tools.iter())
-                .map(|tool| tool.name.as_ref())
+                .map(|tool| tool.name.to_string())
                 .collect::<Vec<_>>();
-            available_tools.sort_unstable();
-            available_tools.dedup();
-            let available_tools = available_tools.join(", ");
+            advertised_tools.sort_unstable();
+            advertised_tools.dedup();
+            let available_tools = advertised_tools.join(", ");
+            let advertised_tools_note = serde_json::to_value(&advertised_tools)?;
             for message in &mut messages_for_provider {
                 for content in &mut message.content {
                     let MessageContent::ToolResponse(response) = content else {
@@ -543,6 +546,17 @@ impl Inference<Session, GooseEffect> for InferenceRunner<'_> {
                                 }
                                 _ => true,
                             });
+                            if chunk
+                                .content
+                                .iter()
+                                .any(|content| matches!(content, MessageContent::ToolRequest(_)))
+                            {
+                                self.set_message_meta(
+                                    &mut chunk,
+                                    ADVERTISED_TOOLS_NOTE,
+                                    advertised_tools_note.clone(),
+                                );
+                            }
                             normalize_tool_call_thinking(&mut accumulator, &mut chunk);
                             if chunk.content.is_empty() {
                                 if chunk.metadata.output_token_limit_reached {
