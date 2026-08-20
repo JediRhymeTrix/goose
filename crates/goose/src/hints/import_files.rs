@@ -2,7 +2,7 @@ use ignore::gitignore::Gitignore;
 use once_cell::sync::Lazy;
 use std::{
     collections::HashSet,
-    io::Read,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
@@ -16,6 +16,7 @@ static FILE_REFERENCE_REGEX: Lazy<regex::Regex> = Lazy::new(|| {
 const MAX_DEPTH: usize = 3;
 const MAX_REFERENCE_OPERATIONS: usize = 64;
 pub(crate) const MAX_HINT_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_HINT_INPUT_BYTES: usize = MAX_HINT_OUTPUT_BYTES;
 
 struct FileReference {
     path: PathBuf,
@@ -25,6 +26,7 @@ struct FileReference {
 
 struct ExpansionBudget {
     remaining_operations: usize,
+    remaining_input_bytes: usize,
     remaining_output_bytes: usize,
     exhausted: bool,
 }
@@ -33,6 +35,7 @@ impl ExpansionBudget {
     fn new(operations: usize, output_bytes: usize) -> Self {
         Self {
             remaining_operations: operations,
+            remaining_input_bytes: MAX_HINT_INPUT_BYTES,
             remaining_output_bytes: output_bytes,
             exhausted: false,
         }
@@ -57,6 +60,15 @@ impl ExpansionBudget {
         if self.remaining_output_bytes == 0 {
             self.exhausted = true;
         }
+        true
+    }
+
+    fn reserve_input(&mut self, bytes: usize) -> bool {
+        if bytes > self.remaining_input_bytes {
+            return false;
+        }
+
+        self.remaining_input_bytes -= bytes;
         true
     }
 
@@ -155,6 +167,29 @@ fn content_between(content: &str, start: usize, end: usize) -> &str {
         .expect("regex match offsets must be UTF-8 boundaries")
 }
 
+fn read_sanitized_hint_file(path: &Path, max_input_bytes: usize) -> io::Result<(String, usize)> {
+    let file = std::fs::File::open(path)?;
+    if file.metadata()?.len() > max_input_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("hint input exceeds the {max_input_bytes}-byte remaining limit"),
+        ));
+    }
+
+    let mut content = String::new();
+    file.take((max_input_bytes as u64).saturating_add(1))
+        .read_to_string(&mut content)?;
+    if content.len() > max_input_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("hint input exceeds the {max_input_bytes}-byte remaining limit"),
+        ));
+    }
+
+    let input_bytes = content.len();
+    Ok((sanitize_unicode_tags(&content), input_bytes))
+}
+
 fn should_process_reference(
     reference: &Path,
     including_file_path: &Path,
@@ -201,28 +236,17 @@ fn process_file_reference(
         return None;
     }
 
-    let file_size = usize::try_from(std::fs::metadata(safe_path).ok()?.len()).ok()?;
-    let estimated_output = expanded_output_cost(reference, file_size)?;
-    let estimated_growth = estimated_output.saturating_sub(replaced_bytes);
-    if !budget.can_fit_output(estimated_growth) {
+    let (content, input_bytes) =
+        match read_sanitized_hint_file(safe_path, budget.remaining_input_bytes) {
+            Ok(content) => content,
+            Err(e) => {
+                tracing::warn!("Could not read file {:?}: {}", safe_path, e);
+                return None;
+            }
+        };
+    if !budget.reserve_input(input_bytes) {
         return None;
     }
-
-    let max_replacement_bytes = budget.remaining_output_bytes.checked_add(replaced_bytes)?;
-    let max_content_bytes = max_replacement_bytes.checked_sub(wrapper_bytes)?;
-    let read_limit = u64::try_from(max_content_bytes).ok()?.saturating_add(1);
-    let mut content = String::new();
-    let read_result = std::fs::File::open(safe_path)
-        .and_then(|file| file.take(read_limit).read_to_string(&mut content));
-    match read_result {
-        Ok(_) => {}
-        Err(e) => {
-            tracing::warn!("Could not read file {:?}: {}", safe_path, e);
-            return None;
-        }
-    }
-
-    let content = sanitize_unicode_tags(&content);
     let output_bytes = expanded_output_cost(reference, content.len())?;
     let output_growth = output_bytes.saturating_sub(replaced_bytes);
     if !budget.reserve_output(output_growth) {
@@ -318,36 +342,17 @@ fn read_referenced_files_with_budget(
     budget: &mut ExpansionBudget,
 ) -> String {
     let max_content_bytes = budget.remaining_output_bytes;
-    let file_size = match std::fs::metadata(file_path)
-        .and_then(|metadata| usize::try_from(metadata.len()).map_err(std::io::Error::other))
-    {
-        Ok(file_size) => file_size,
-        Err(e) => {
-            tracing::warn!("Could not inspect hint file {:?}: {}", file_path, e);
-            return String::new();
-        }
-    };
-    if file_size > max_content_bytes {
-        tracing::warn!(
-            "Hint file too large: {:?} ({} bytes, remaining limit: {} bytes)",
-            file_path,
-            file_size,
-            max_content_bytes
-        );
+    let (content, input_bytes) =
+        match read_sanitized_hint_file(file_path, budget.remaining_input_bytes) {
+            Ok(content) => content,
+            Err(e) => {
+                tracing::warn!("Could not read hint file {:?}: {}", file_path, e);
+                return String::new();
+            }
+        };
+    if !budget.reserve_input(input_bytes) {
         return String::new();
     }
-
-    let read_limit = u64::try_from(max_content_bytes)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1);
-    let mut content = String::new();
-    let read_result = std::fs::File::open(file_path)
-        .and_then(|file| file.take(read_limit).read_to_string(&mut content));
-    if let Err(e) = read_result {
-        tracing::warn!("Could not read hint file {:?}: {}", file_path, e);
-        return String::new();
-    }
-    let content = sanitize_unicode_tags(&content);
     if content.len() > max_content_bytes || !budget.reserve_output(content.len()) {
         tracing::warn!(
             "Hint file too large: {:?} (remaining limit: {} bytes)",
@@ -623,6 +628,79 @@ mod tests {
             assert!(content.len() < normalized.len() - 1);
             assert_eq!(at_boundary, normalized);
             assert!(below_boundary.is_empty());
+        }
+
+        #[test]
+        fn test_top_level_budget_uses_sanitized_output_size() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let import_boundary = temp_dir.path();
+            let ignore_patterns = create_ignore_patterns(import_boundary);
+            let sanitized = "fit";
+            let content = format!("{sanitized}{}", "\u{E0041}".repeat(8));
+            let main_file = create_file(import_boundary, "main.md", &content);
+
+            let expanded = read_with_budget(
+                &main_file,
+                import_boundary,
+                &ignore_patterns,
+                MAX_REFERENCE_OPERATIONS,
+                sanitized.len(),
+            );
+
+            assert!(content.len() > sanitized.len());
+            assert_eq!(expanded, sanitized);
+        }
+
+        #[test]
+        fn test_reference_budget_uses_sanitized_output_size() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let import_boundary = temp_dir.path();
+            let ignore_patterns = create_ignore_patterns(import_boundary);
+            let reference = Path::new("included.md");
+            let sanitized = "fit";
+            create_file(
+                import_boundary,
+                reference.to_str().unwrap(),
+                &format!("{sanitized}{}", "\u{E0041}".repeat(8)),
+            );
+            let main_content = "@included.md";
+            let main_file = create_file(import_boundary, "main.md", main_content);
+            let output_limit = main_content.len()
+                + expanded_output_cost(reference, sanitized.len()).unwrap()
+                - replaced_reference_cost(reference).unwrap();
+
+            let expanded = read_with_budget(
+                &main_file,
+                import_boundary,
+                &ignore_patterns,
+                MAX_REFERENCE_OPERATIONS,
+                output_limit,
+            );
+
+            assert!(expanded.contains(sanitized));
+            assert!(!expanded.contains(main_content));
+        }
+
+        #[test]
+        fn test_top_level_input_limit_remains_bounded() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let import_boundary = temp_dir.path();
+            let ignore_patterns = create_ignore_patterns(import_boundary);
+            let main_file = create_file(
+                import_boundary,
+                "main.md",
+                &"x".repeat(MAX_HINT_INPUT_BYTES + 1),
+            );
+
+            let expanded = read_with_budget(
+                &main_file,
+                import_boundary,
+                &ignore_patterns,
+                MAX_REFERENCE_OPERATIONS,
+                MAX_HINT_OUTPUT_BYTES,
+            );
+
+            assert!(expanded.is_empty());
         }
 
         #[test]
