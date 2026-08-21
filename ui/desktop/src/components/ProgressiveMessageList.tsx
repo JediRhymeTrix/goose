@@ -69,7 +69,7 @@ interface ProgressiveMessageListProps {
     newContent: string,
     editType: 'fork' | 'edit',
     retainedImages: ImageData[]
-  ) => void;
+  ) => Promise<boolean>;
   onRenderingComplete?: () => void; // Callback when all messages are rendered
   submitElicitationResponse?: (
     elicitationId: string,

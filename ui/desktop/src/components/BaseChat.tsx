@@ -167,10 +167,17 @@ export default function BaseChat({
       editType: 'fork' | 'edit',
       retainedImages: ImageData[]
     ) => {
-      if (!recipeAccepted) return Promise.resolve();
+      if (!recipeAccepted) return Promise.resolve(false);
       return onMessageUpdate(messageId, newContent, editType, retainedImages);
     },
     [recipeAccepted, onMessageUpdate]
+  );
+  const handleSubmitElicitationResponse = useCallback(
+    (elicitationId: string, userData: Record<string, unknown>) => {
+      if (!recipeAccepted) return Promise.resolve(false);
+      return submitElicitationResponse(elicitationId, userData);
+    },
+    [recipeAccepted, submitElicitationResponse]
   );
 
   const resolvedInitialMessage = useMemo((): UserInput | undefined => {
@@ -529,7 +536,7 @@ export default function BaseChat({
                     isStreamingMessage={chatState !== ChatState.Idle}
                     onRenderingComplete={handleRenderingComplete}
                     onMessageUpdate={handleMessageUpdate}
-                    submitElicitationResponse={submitElicitationResponse}
+                    submitElicitationResponse={handleSubmitElicitationResponse}
                   />
                 </SearchView>
 
