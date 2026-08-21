@@ -160,6 +160,18 @@ export default function BaseChat({
     },
     [recipeAccepted, onSteerQueuedMessage]
   );
+  const handleMessageUpdate = useCallback(
+    (
+      messageId: string,
+      newContent: string,
+      editType: 'fork' | 'edit',
+      retainedImages: ImageData[]
+    ) => {
+      if (!recipeAccepted) return Promise.resolve();
+      return onMessageUpdate(messageId, newContent, editType, retainedImages);
+    },
+    [recipeAccepted, onMessageUpdate]
+  );
 
   const resolvedInitialMessage = useMemo((): UserInput | undefined => {
     if (!initialMessage) return undefined;
@@ -262,7 +274,12 @@ export default function BaseChat({
     let cancelled = false;
 
     void (async () => {
-      const accepted = await window.electron.hasAcceptedRecipeBefore(recipe);
+      let accepted = false;
+      try {
+        accepted = await window.electron.hasAcceptedRecipeBefore(recipe);
+      } catch (error) {
+        console.error('Failed to check recipe trust:', error);
+      }
       if (cancelled) return;
       setRecipeTrust({ identity: recipeIdentity, accepted });
 
@@ -507,7 +524,7 @@ export default function BaseChat({
                     isUserMessage={(m: Message) => m.role === 'user'}
                     isStreamingMessage={chatState !== ChatState.Idle}
                     onRenderingComplete={handleRenderingComplete}
-                    onMessageUpdate={onMessageUpdate}
+                    onMessageUpdate={handleMessageUpdate}
                     submitElicitationResponse={submitElicitationResponse}
                   />
                 </SearchView>
