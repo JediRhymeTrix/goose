@@ -37,6 +37,7 @@ interface GooseMessageProps {
     elicitationId: string,
     userData: Record<string, unknown>
   ) => Promise<boolean>;
+  toolApprovalDisabled?: boolean;
 }
 
 function GooseMessage({
@@ -47,6 +48,7 @@ function GooseMessage({
   append,
   isStreaming,
   submitElicitationResponse,
+  toolApprovalDisabled = false,
 }: GooseMessageProps) {
   const contentRef = useRef<HTMLDivElement | null>(null);
 
@@ -203,6 +205,7 @@ function GooseMessage({
                         append={append}
                         confirmationContent={confirmationContent}
                         isApprovalClicked={isApprovalClicked}
+                        toolApprovalDisabled={toolApprovalDisabled}
                       />
                     </div>
                   );
@@ -240,6 +243,7 @@ function GooseMessage({
             sessionId={sessionId}
             isClicked={false}
             actionRequiredContent={toolConfirmationContent}
+            disabled={toolApprovalDisabled}
           />
         )}
 

@@ -75,6 +75,7 @@ interface ProgressiveMessageListProps {
     elicitationId: string,
     userData: Record<string, unknown>
   ) => Promise<boolean>;
+  toolApprovalDisabled?: boolean;
 }
 
 export default function ProgressiveMessageList({
@@ -91,6 +92,7 @@ export default function ProgressiveMessageList({
   onMessageUpdate,
   onRenderingComplete,
   submitElicitationResponse,
+  toolApprovalDisabled = false,
 }: ProgressiveMessageListProps) {
   const intl = useIntl();
   const [renderedCount, setRenderedCount] = useState(() => {
@@ -314,6 +316,7 @@ export default function ProgressiveMessageList({
                     message.role === 'assistant'
                   }
                   submitElicitationResponse={submitElicitationResponse}
+                  toolApprovalDisabled={toolApprovalDisabled}
                 />
               )}
             </div>
@@ -333,6 +336,7 @@ export default function ProgressiveMessageList({
     onMessageUpdate,
     toolCallChains,
     submitElicitationResponse,
+    toolApprovalDisabled,
     getPreviousResolvedModel,
     getResolvedModel,
     renderModelChangeDisclosure,
